@@ -1,6 +1,7 @@
 import os
 import re
 import html
+import json
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -149,6 +150,57 @@ def parse_artwork_metadata(raw_title):
         'number': number
     }
 
+def resolve_artwork_image_paths(thumb_path, full_href, base_path):
+    clean_thumb = thumb_path.strip() if thumb_path else ""
+    clean_full = full_href.strip() if full_href else ""
+    
+    if clean_full.lower().endswith(('.html', '.htm', '.php', '.asp', '.aspx', '.jsp')) or clean_full.startswith('#') or clean_full.startswith('javascript:'):
+        clean_full = ""
+        
+    resolved_full = ""
+    resolved_thumb = clean_thumb
+    
+    # 1. Check if thumb has an _orig counterpart on disk
+    if clean_thumb:
+        base_no_ext, ext = os.path.splitext(clean_thumb)
+        if not base_no_ext.endswith('_orig'):
+            orig_candidate = f"{base_no_ext}_orig{ext}"
+            local_orig = os.path.join(base_path, orig_candidate.replace('/', '\\'))
+            if os.path.exists(local_orig):
+                resolved_full = orig_candidate
+    
+    # 2. If no _orig found from thumb, check clean_full
+    if not resolved_full and clean_full:
+        local_full = os.path.join(base_path, clean_full.replace('/', '\\'))
+        if os.path.exists(local_full):
+            resolved_full = clean_full
+
+    # 3. If still no full, check if thumb exists
+    if not resolved_full and clean_thumb:
+        local_thumb = os.path.join(base_path, clean_thumb.replace('/', '\\'))
+        if os.path.exists(local_thumb):
+            resolved_full = clean_thumb
+
+    # Fallback to whatever string was provided if not on disk
+    if not resolved_full:
+        resolved_full = clean_full if clean_full else clean_thumb
+    if not resolved_thumb:
+        resolved_thumb = resolved_full
+
+    # Check disk existence and size
+    local_thumb_path = os.path.join(base_path, resolved_thumb.replace('/', '\\')) if resolved_thumb else ""
+    local_full_path = os.path.join(base_path, resolved_full.replace('/', '\\')) if resolved_full else ""
+    
+    exists_thumb = os.path.exists(local_thumb_path) if local_thumb_path else False
+    exists_full = os.path.exists(local_full_path) if local_full_path else False
+    
+    exists_local = "Ja" if (exists_full or exists_thumb) else "Nein"
+    
+    actual_file_to_measure = local_full_path if exists_full else (local_thumb_path if exists_thumb else None)
+    file_size_kb = round(os.path.getsize(actual_file_to_measure) / 1024, 1) if actual_file_to_measure else 0.0
+
+    return resolved_thumb, resolved_full, exists_local, file_size_kb
+
 def extract_website_data():
     print("Parsing website structure...")
     pages_meta = get_site_structure()
@@ -261,12 +313,7 @@ def extract_website_data():
 
                 raw_caption = clean_text(raw_caption)
 
-                local_thumb = os.path.join(BASE_PATH, img_src.replace('/', '\\')) if img_src else ''
-                local_full = os.path.join(BASE_PATH, full_href.replace('/', '\\')) if full_href else ''
-
-                exists_thumb = os.path.exists(local_thumb) if local_thumb else False
-                exists_full = os.path.exists(local_full) if local_full else False
-                file_size_kb = round(os.path.getsize(local_full if exists_full else local_thumb) / 1024, 1) if (exists_full or exists_thumb) else 0
+                thumb_res, full_res, exists_local, file_size_kb = resolve_artwork_image_paths(img_src, full_href, BASE_PATH)
 
                 meta = parse_artwork_metadata(raw_caption)
 
@@ -289,9 +336,9 @@ def extract_website_data():
                     'year': meta['year'],
                     'number': meta['number'],
                     'image_type': 'Galerie-Kunstwerk',
-                    'thumb_path': img_src,
-                    'full_path': full_href,
-                    'exists_local': 'Ja' if (exists_thumb or exists_full) else 'Nein',
+                    'thumb_path': thumb_res,
+                    'full_path': full_res,
+                    'exists_local': exists_local,
                     'file_size_kb': file_size_kb
                 })
 
@@ -312,12 +359,7 @@ def extract_website_data():
                 raw_caption = caption_elem.get_text(separator=' ', strip=True) if caption_elem else (img.get('alt', '') or (a.get('title', '') if a else ''))
                 raw_caption = clean_text(raw_caption)
 
-                local_thumb = os.path.join(BASE_PATH, img_src.replace('/', '\\'))
-                local_full = os.path.join(BASE_PATH, full_href.replace('/', '\\')) if full_href else ''
-
-                exists_thumb = os.path.exists(local_thumb)
-                exists_full = os.path.exists(local_full) if local_full else False
-                file_size_kb = round(os.path.getsize(local_full if exists_full else local_thumb) / 1024, 1) if (exists_full or exists_thumb) else 0
+                thumb_res, full_res, exists_local, file_size_kb = resolve_artwork_image_paths(img_src, full_href, BASE_PATH)
 
                 meta = parse_artwork_metadata(raw_caption)
 
@@ -338,9 +380,9 @@ def extract_website_data():
                     'year': meta['year'],
                     'number': meta['number'],
                     'image_type': 'Einzelabbildung / Foto',
-                    'thumb_path': img_src,
-                    'full_path': full_href if full_href else img_src,
-                    'exists_local': 'Ja' if (exists_thumb or exists_full) else 'Nein',
+                    'thumb_path': thumb_res,
+                    'full_path': full_res,
+                    'exists_local': exists_local,
                     'file_size_kb': file_size_kb
                 })
 
@@ -795,6 +837,35 @@ def generate_html_documentation(pages_data, all_texts, all_artworks, all_links, 
     # Relative base prefix for images and html files
     rel_site_prefix = "436167332711627763-1789638831/7897076666aabb50cb36a1/"
     abs_site_prefix = "file:///D:/Hans_Glanzmann/436167332711627763-1789638831/7897076666aabb50cb36a1/"
+
+    # Build Artworks JSON registry for safe, robust, error-free modal interaction
+    artworks_dict = {}
+    for a in all_artworks:
+        img_src_rel = f"{rel_site_prefix}{a['thumb_path']}" if a['thumb_path'] else ""
+        img_full_rel = f"{rel_site_prefix}{a['full_path']}" if a['full_path'] else img_src_rel
+        img_abs = f"{abs_site_prefix}{a['thumb_path']}" if a['thumb_path'] else ""
+        img_full_abs = f"{abs_site_prefix}{a['full_path']}" if a['full_path'] else img_abs
+        
+        artworks_dict[a['artwork_id']] = {
+            'id': a['artwork_id'],
+            'title': a['title'],
+            'raw_caption': a['raw_caption'],
+            'technique': a['technique'],
+            'dimensions': a['dimensions'],
+            'year': a['year'],
+            'number': a['number'],
+            'menu_title': a['menu_title'],
+            'file_name': a['file_name'],
+            'file_size_kb': a['file_size_kb'],
+            'exists_local': a['exists_local'],
+            'image_type': a['image_type'],
+            'thumb_rel': img_src_rel,
+            'thumb_abs': img_abs,
+            'full_rel': img_full_rel,
+            'full_abs': img_full_abs
+        }
+
+    artworks_json_str = json.dumps(artworks_dict, ensure_ascii=False)
 
     # Build KPI Summary cards
     total_pages = len(pages_data)
@@ -1764,7 +1835,7 @@ def generate_html_documentation(pages_data, all_texts, all_artworks, all_links, 
                         <tr data-tech="{html.escape(a['technique'])}" data-exists="{a['exists_local']}">
                             <td class="text-center"><span class="badge-id">{safe_id}</span></td>
                             <td class="text-center">
-                                <div class="thumb-wrap" onclick="openLightbox('{img_full_rel}', '{safe_id}', '{safe_title}', '{safe_tech}', '{safe_dims}', '{safe_year}', '{safe_num}', '{safe_rubrik}', '{safe_file}', '{a['file_size_kb']}')">
+                                <div class="thumb-wrap" onclick="openLightboxById('{safe_id}')">
                                     <img src="{img_src_rel}" data-fallback="{img_abs}" class="thumb-img" loading="lazy" alt="{safe_title}" onerror="handleImgError(this)">
                                 </div>
                             </td>
@@ -1812,7 +1883,7 @@ def generate_html_documentation(pages_data, all_texts, all_artworks, all_links, 
 
         parts.append(f"""
                 <div class="gallery-card" data-tech="{html.escape(a['technique'])}" data-exists="{a['exists_local']}">
-                    <div class="gallery-card-img-wrap" onclick="openLightbox('{img_full_rel}', '{safe_id}', '{safe_title}', '{safe_tech}', '{safe_dims}', '{safe_year}', '{safe_num}', '{safe_rubrik}', '{safe_file}', '{a['file_size_kb']}')">
+                    <div class="gallery-card-img-wrap" onclick="openLightboxById('{safe_id}')">
                         <span class="gallery-card-badge">{safe_id}</span>
                         <img src="{img_src_rel}" data-fallback="{img_abs}" class="gallery-card-img" loading="lazy" alt="{safe_title}" onerror="handleImgError(this)">
                     </div>
@@ -1907,7 +1978,7 @@ def generate_html_documentation(pages_data, all_texts, all_artworks, all_links, 
             </div>
             <div class="modal-body">
                 <div class="modal-img-area">
-                    <img src="" id="modal-image" class="modal-img" alt="Kunstwerk">
+                    <img src="" id="modal-image" class="modal-img" alt="Kunstwerk" onerror="handleModalImgError(this)">
                 </div>
                 <div class="modal-details">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
@@ -1929,7 +2000,15 @@ def generate_html_documentation(pages_data, all_texts, all_artworks, all_links, 
             </div>
         </div>
     </div>
+""")
 
+    parts.append(f"""
+    <script>
+        const ARTWORKS_DATA = {artworks_json_str};
+    </script>
+""")
+
+    parts.append("""
     <script>
         // Tab switching
         function switchTab(tabId, btn) {
@@ -1965,9 +2044,47 @@ def generate_html_documentation(pages_data, all_texts, all_artworks, all_links, 
             }
         }
 
+        function handleModalImgError(img) {
+            if (!img.dataset.triedFallback && img.dataset.fallback) {
+                img.dataset.triedFallback = '1';
+                img.src = img.dataset.fallback;
+            }
+        }
+
         // Lightbox
+        function openLightboxById(id) {
+            const a = ARTWORKS_DATA[id];
+            if (!a) return;
+
+            const modalImg = document.getElementById('modal-image');
+            modalImg.dataset.triedFallback = '';
+            modalImg.dataset.fallback = a.full_abs || a.thumb_abs;
+            modalImg.src = a.full_rel || a.thumb_rel;
+            modalImg.alt = a.title || a.raw_caption;
+
+            const displayTitle = a.title || a.raw_caption;
+            document.getElementById('modal-id').textContent = a.id;
+            document.getElementById('modal-title').textContent = a.id + ' – ' + displayTitle;
+            document.getElementById('modal-work-title').textContent = displayTitle;
+            document.getElementById('modal-tech').textContent = a.technique || '-';
+            document.getElementById('modal-dims').textContent = a.dimensions || '-';
+            document.getElementById('modal-year').textContent = a.year || '-';
+            document.getElementById('modal-num').textContent = a.number || '-';
+            document.getElementById('modal-rubrik').textContent = a.menu_title || '-';
+            document.getElementById('modal-file').innerHTML = `<a href="436167332711627763-1789638831/7897076666aabb50cb36a1/${a.file_name}" target="_blank" class="table-link">${a.file_name} ↗</a>`;
+            document.getElementById('modal-size').textContent = a.file_size_kb ? a.file_size_kb + ' KB' : '-';
+            document.getElementById('modal-img-link').href = a.full_rel || a.thumb_rel;
+
+            document.getElementById('lightbox-modal').classList.add('active');
+        }
+
         function openLightbox(imgSrc, id, title, tech, dims, year, num, rubrik, file, size) {
-            document.getElementById('modal-image').src = imgSrc;
+            if (id && ARTWORKS_DATA[id]) {
+                openLightboxById(id);
+                return;
+            }
+            const modalImg = document.getElementById('modal-image');
+            modalImg.src = imgSrc;
             document.getElementById('modal-id').textContent = id;
             document.getElementById('modal-title').textContent = id + ' – ' + title;
             document.getElementById('modal-work-title').textContent = title;
@@ -1979,7 +2096,6 @@ def generate_html_documentation(pages_data, all_texts, all_artworks, all_links, 
             document.getElementById('modal-file').innerHTML = `<a href="436167332711627763-1789638831/7897076666aabb50cb36a1/${file}" target="_blank" class="table-link">${file} ↗</a>`;
             document.getElementById('modal-size').textContent = size ? size + ' KB' : '-';
             document.getElementById('modal-img-link').href = imgSrc;
-
             document.getElementById('lightbox-modal').classList.add('active');
         }
 
